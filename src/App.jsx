@@ -9,8 +9,6 @@ function playChipRattle(){try{const ctx=getAudioCtx();for(let i=0;i<5;i++){const
 
 import * as DB from "./db";
 
-
-
 // ═══════════════════════════════════════════════
 // RATING SYSTEM (Weighted Career Matchpoint %)
 // Your rating IS your number: "I'm a 57" = you beat field 57%
@@ -1201,8 +1199,18 @@ export default function App(){
   const[sessionIMPs,setSessionIMPs]=useState(0)
   const[currentOrbit,setCurrentOrbit]=useState(null)
   const[selectedPlayer,setSelectedPlayer]=useState(null)
+  const[showRules,setShowRules]=useState(false)
+  const prevTurnRef=useRef(false)
   const rngRef=useRef(Date.now())
   const liveRng=useCallback(()=>{rngRef.current=(rngRef.current*16807)%2147483647;if(rngRef.current<=0)rngRef.current+=2147483646;return(rngRef.current-1)/2147483646},[])
+
+  // Sound: ding when it's your turn (must be before early returns)
+  const _cp=game&&game.players?game.players[game.activeIdx]||{}:{}
+  const _isHumanTurn=!!game&&!!_cp.isHuman&&!_cp.folded&&["preflop","flop","turn","river"].includes(game.phase)
+  useEffect(()=>{
+    if(_isHumanTurn&&!prevTurnRef.current)playDing()
+    prevTurnRef.current=_isHumanTurn
+  },[_isHumanTurn])
 
   function initLocalGame(seed,orbitNum){
     return{seed,handNumber:0,handInOrbit:0,phase:"ready",
@@ -1409,18 +1417,9 @@ export default function App(){
   }
 
   // Main table
-  const cp=game.players[game.activeIdx]||{}
-  const isHumanTurn=cp.isHuman&&!cp.folded&&["preflop","flop","turn","river"].includes(game.phase)
-  const humanPnL=game.players[0].chips-STARTING
-
-  // Sound: ding when it's your turn
-  const prevTurnRef=useRef(false)
-  useEffect(()=>{
-    if(isHumanTurn&&!prevTurnRef.current)playDing()
-    prevTurnRef.current=isHumanTurn
-  },[isHumanTurn])
-
-  const[showRules,setShowRules]=useState(false)
+  const cp=game?game.players[game.activeIdx]||{}:{}
+  const isHumanTurn=game&&cp.isHuman&&!cp.folded&&["preflop","flop","turn","river"].includes(game.phase)
+  const humanPnL=game?(game.players[0].chips-STARTING):0
 
   return <div style={{minHeight:"100vh",background:"linear-gradient(135deg,#0a0a14,#0d1117,#0a0f0a)",display:"flex",flexDirection:"column",alignItems:"center",fontFamily:F,color:"#e0e0e0",padding:"8px 8px 0",position:"relative"}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",width:"100%",maxWidth:660,marginBottom:4,padding:"0 4px"}}>
