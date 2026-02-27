@@ -422,25 +422,27 @@ function Lobby({onJoined,onViewResults}){
     async function loadGames(){
       try{
         const idx=await DB.getRoomIndex()
+        if(!idx||!Array.isArray(idx)){setGamesLoading(false);return}
         const enriched=[]
         for(const g of idx.slice(0,12)){
-          const room=await DB.getRoom(g.code)
-          if(!room)continue
-          // Check completion status of each player
-          let allDone=true,anyStarted=false
-          const playerStatus=[]
-          for(const p of room.players){
-            const results=await DB.getAllResults(g.code,p.num,room.orbits)
-            const completed=results.filter(r=>r!==null).length
-            const done=completed>=room.orbits
-            if(!done)allDone=false
-            if(completed>0)anyStarted=true
-            playerStatus.push({...p,completed,done})
-          }
-          enriched.push({...g,players:room.players.map(p=>p.name),playerStatus,orbits:room.orbits,allDone,anyStarted,playerCount:room.players.length})
+          try{
+            const room=await DB.getRoom(g.code)
+            if(!room||!room.players)continue
+            let allDone=true,anyStarted=false
+            const playerStatus=[]
+            for(const p of room.players){
+              const results=await DB.getAllResults(g.code,p.num,room.orbits)
+              const completed=results.filter(r=>r!==null).length
+              const done=completed>=room.orbits
+              if(!done)allDone=false
+              if(completed>0)anyStarted=true
+              playerStatus.push({...p,completed,done})
+            }
+            enriched.push({...g,players:room.players.map(p=>p.name),playerStatus,orbits:room.orbits,allDone,anyStarted,playerCount:room.players.length})
+          }catch(e){continue}
         }
         setRecentGames(enriched)
-      }catch(e){console.error(e)}
+      }catch(e){console.error("Load games error:",e)}
       setGamesLoading(false)
     }
     loadGames()
@@ -455,46 +457,43 @@ function Lobby({onJoined,onViewResults}){
       await DB.createRoom(rc,seeds[0],orbits,seeds,name.trim())
       setLoading(false)
       onJoined({code:rc,seeds,orbits,playerNum:1,myName:name.trim(),totalPlayers:1})
-    }catch(e){setLoading(false);setStatus("Error creating room: "+e.message)}
+    }catch(e){setLoading(false);setStatus("Error starting game: "+e.message)}
   }
 
   const joinRoom=async()=>{
     if(!name.trim())return setStatus("Enter your name")
-    if(!code.trim()||code.trim().length!==4)return setStatus("Enter 4-letter room code")
+    if(!code.trim()||code.trim().length!==4)return setStatus("Enter 4-letter game code")
     setLoading(true)
     try{
       const rc=code.trim().toUpperCase()
       const room=await DB.getRoom(rc)
-      if(!room){setLoading(false);return setStatus("Room not found")}
-      // Check if player has viewed results — block entry
-      const viewed=await DB.hasViewedResults(rc,name.trim())
-      if(viewed){setLoading(false);return setStatus("You've already viewed results for this room — can't join")}
-      if(room.players.length>=10&&!room.players.some(p=>p.name===name.trim())){setLoading(false);return setStatus("Room is full (max 10)")}
+      if(!room){setLoading(false);return setStatus("Game not found")}
+      let viewed=false;try{viewed=await DB.hasViewedResults(rc,name.trim())}catch(e){}
+      if(viewed){setLoading(false);return setStatus("You've already viewed results for this game — can't join")}
+      if(room.players.length>=10&&!room.players.some(p=>p.name===name.trim())){setLoading(false);return setStatus("Game is full (max 10)")}
       if(!room.players.some(p=>p.name===name.trim())){await DB.joinRoom(rc,name.trim())}
       const updatedRoom=await DB.getRoom(rc)
       const me=updatedRoom.players.find(p=>p.name===name.trim())
       const playerNum=me?me.num:(updatedRoom.players.length)
       setLoading(false)
-      onJoined({code:rc,seeds:updatedRoom.seeds,orbits:updatedRoom.orbits,playerNum,myName:name.trim(),totalPlayers:updatedRoom.players.length})
+      onJoined({code:rc,seeds:updatedRoom.seeds,orbits:updatedRoom.orbits,playerNum,myName:name.trim(),totalPlayers:updatedRoom.players.length},true)
     }catch(e){setLoading(false);setStatus("Error: "+e.message)}
   }
 
   const joinGameFromList=async(g)=>{
     if(!name.trim())return setStatus("Enter your name first")
-    const viewed=await DB.hasViewedResults(g.code,name.trim())
-    if(viewed)return setStatus("You've already viewed results for room "+g.code)
-    setCode(g.code);setMode("join");
-    // Auto-join if code is set
-    setTimeout(async()=>{
+    let viewed=false;try{viewed=await DB.hasViewedResults(g.code,name.trim())}catch(e){}
+    if(viewed)return setStatus("You've already viewed results for game "+g.code)
+    try{
       const rc=g.code
       const room=await DB.getRoom(rc)
-      if(!room)return setStatus("Room not found")
-      if(room.players.length>=10&&!room.players.some(p=>p.name===name.trim()))return setStatus("Room full")
+      if(!room)return setStatus("Game not found")
+      if(room.players.length>=10&&!room.players.some(p=>p.name===name.trim()))return setStatus("Game full")
       if(!room.players.some(p=>p.name===name.trim())){await DB.joinRoom(rc,name.trim())}
       const updatedRoom=await DB.getRoom(rc)
       const me=updatedRoom.players.find(p=>p.name===name.trim())
-      onJoined({code:rc,seeds:updatedRoom.seeds,orbits:updatedRoom.orbits,playerNum:me?me.num:updatedRoom.players.length,myName:name.trim(),totalPlayers:updatedRoom.players.length})
-    },50)
+      onJoined({code:rc,seeds:updatedRoom.seeds,orbits:updatedRoom.orbits,playerNum:me?me.num:updatedRoom.players.length,myName:name.trim(),totalPlayers:updatedRoom.players.length},true)
+    }catch(e){setStatus("Error: "+e.message)}
   }
 
   const I={background:"rgba(255,255,255,0.08)",border:"1px solid rgba(255,255,255,0.15)",borderRadius:8,padding:"10px 14px",fontSize:15,color:"#e0e0e0",fontFamily:F,width:"100%",boxSizing:"border-box",outline:"none"}
@@ -521,8 +520,8 @@ function Lobby({onJoined,onViewResults}){
           </div>
         </div>}
         <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12}}>
-          <button onClick={()=>{if(!name.trim())return setStatus("Enter your name");setMode("create")}} style={B("linear-gradient(135deg,#27ae60,#1e8449)")}>Create Room</button>
-          <button onClick={()=>{if(!name.trim())return setStatus("Enter your name");setMode("join")}} style={B("linear-gradient(135deg,#2980b9,#1a5276)")}>Join Room</button>
+          <button onClick={()=>{if(!name.trim())return setStatus("Enter your name");setMode("create")}} style={B("linear-gradient(135deg,#27ae60,#1e8449)")}>Start Game</button>
+          <button onClick={()=>{if(!name.trim())return setStatus("Enter your name");setMode("join")}} style={B("linear-gradient(135deg,#2980b9,#1a5276)")}>Join Game</button>
           <button onClick={()=>onViewResults(null,null)} style={B("linear-gradient(135deg,#2c3e50,#1a252f)")}>Player Lookup</button>
           <button onClick={()=>onViewResults("__rankings__",null)} style={B("linear-gradient(135deg,#8e44ad,#6c3483)")}>🏆 Rankings</button>
         </div>
@@ -570,12 +569,12 @@ function Lobby({onJoined,onViewResults}){
           </div>
           <div style={{textAlign:"center",color:"#666",fontSize:11,marginTop:4}}>{orbits*HANDS_PER_ORBIT} hands · ~{Math.round(orbits*HANDS_PER_ORBIT*2.5)} min</div>
         </div>
-        <button onClick={createRoom} disabled={loading} style={B("linear-gradient(135deg,#27ae60,#1e8449)")}>{loading?"Creating...":"Create Room"}</button>
+        <button onClick={createRoom} disabled={loading} style={B("linear-gradient(135deg,#27ae60,#1e8449)")}>{loading?"Starting...":"Start Game"}</button>
       </>}
 
       {mode==="join"&&<>
-        <div style={{marginBottom:12}}><input placeholder="Room code (4 letters)" value={code} onChange={e=>setCode(e.target.value.toUpperCase())} maxLength={4} style={{...I,textAlign:"center",fontSize:24,letterSpacing:8}}/></div>
-        <button onClick={joinRoom} disabled={loading} style={B("linear-gradient(135deg,#2980b9,#1a5276)")}>{loading?"Joining...":"Join Room"}</button>
+        <div style={{marginBottom:12}}><input placeholder="Game code (4 letters)" value={code} onChange={e=>setCode(e.target.value.toUpperCase())} maxLength={4} style={{...I,textAlign:"center",fontSize:24,letterSpacing:8}}/></div>
+        <button onClick={joinRoom} disabled={loading} style={B("linear-gradient(135deg,#2980b9,#1a5276)")}>{loading?"Joining...":"Join Game"}</button>
       </>}
 
       {mode==="rules"&&<div style={{lineHeight:1.7,fontSize:13,color:"#ccc"}}>
@@ -1214,7 +1213,16 @@ export default function App(){
       handFlags:{vpip:false,pfr:false,threeBet:false}}
   }
 
-  const onJoined=useCallback((info)=>{setRoomInfo(info);setView("shareCode")},[])
+  const onJoined=useCallback((info,skipShareCode)=>{
+    setRoomInfo(info)
+    if(skipShareCode){
+      // Go straight to playing (joining existing game)
+      const g=initLocalGame(info.seeds[0],1)
+      setGame(g);setView("playing");setTimeout(()=>startHand(),100)
+    }else{
+      setView("shareCode")
+    }
+  },[])
 
   const startPlaying=useCallback(()=>{
     const orbitNum=1
@@ -1347,7 +1355,7 @@ export default function App(){
     if(code==="__rankings__"){setView("rankings");return}
     try{
       const room=await DB.getRoom(code)
-      if(!room)return alert("Room not found")
+      if(!room)return alert("Game not found")
       if(name){
         const player=room.players.find(p=>p.name===name)
         if(!player)return alert("Name not found in room")
