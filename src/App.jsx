@@ -1,6 +1,14 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 
+// ─── Sound Effects (Web Audio API) ───
+const AudioCtx=window.AudioContext||window.webkitAudioContext
+let _actx=null
+function getAudioCtx(){if(!_actx)_actx=new AudioCtx();return _actx}
+function playDing(){try{const ctx=getAudioCtx(),o=ctx.createOscillator(),g=ctx.createGain();o.connect(g);g.connect(ctx.destination);o.frequency.setValueAtTime(880,ctx.currentTime);o.frequency.setValueAtTime(1174,ctx.currentTime+0.08);o.type="sine";g.gain.setValueAtTime(0.15,ctx.currentTime);g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.3);o.start(ctx.currentTime);o.stop(ctx.currentTime+0.3)}catch(e){}}
+function playChipRattle(){try{const ctx=getAudioCtx();for(let i=0;i<5;i++){const t=ctx.currentTime+i*0.04+Math.random()*0.02;const buf=ctx.createBuffer(1,ctx.sampleRate*0.03,ctx.sampleRate),d=buf.getChannelData(0);for(let j=0;j<d.length;j++)d[j]=(Math.random()*2-1)*0.15;const s=ctx.createBufferSource(),g=ctx.createGain(),f=ctx.createBiquadFilter();f.type="bandpass";f.frequency.value=3000+Math.random()*3000;f.Q.value=2;s.buffer=buf;s.connect(f);f.connect(g);g.connect(ctx.destination);g.gain.setValueAtTime(0.12,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.06);s.start(t)}}catch(e){}}
+
 import * as DB from "./db";
+
 
 
 // ═══════════════════════════════════════════════
@@ -42,6 +50,53 @@ async function updateRating(name, mpPct, maxMP, totalMP, imps, roomCode, orbits)
   const rating = calcWeightedRating(prof.history)
   await DB.saveProfile(name, prof)
   return { prof, rating, prev, delta: prev !== null ? +(rating - prev).toFixed(1) : null }
+}
+
+// Update AI bot profiles after a session completes
+async function updateBotRatings(roomCode, totalOrbits, seeds) {
+  try {
+    const room = await DB.getRoom(roomCode)
+    if (!room) return
+    // For each orbit, collect all PnLs (humans + AI bots)
+    const botTotals = {} // botName -> {mp, maxMp}
+    AI_PROFILES.forEach(p => { botTotals[p.name] = { mp: 0, maxMp: 0 } })
+    for (let o = 1; o <= totalOrbits; o++) {
+      const allPnls = [] // {name, pnl}
+      // Recompute AI results (deterministic)
+      for (let i = 0; i < NUM_AI; i++) {
+        const pnl = simOrbit(seeds[o - 1], 0, i)
+        allPnls.push({ name: AI_PROFILES[i].name, pnl, isBot: true })
+      }
+      // Gather human results
+      for (const p of room.players) {
+        const r = await DB.getOrbitResult(roomCode, p.num, o)
+        if (r) allPnls.push({ name: p.name, pnl: r.pnl, isBot: false })
+      }
+      // Compute matchpoints for each bot
+      for (const bot of allPnls.filter(x => x.isBot)) {
+        const opponents = allPnls.filter(x => x.name !== bot.name)
+        let mp = 0
+        for (const opp of opponents) { if (bot.pnl > opp.pnl) mp += 1; else if (bot.pnl === opp.pnl) mp += 0.5 }
+        botTotals[bot.name].mp += mp
+        botTotals[bot.name].maxMp += opponents.length
+      }
+    }
+    // Update each bot's profile
+    for (const [botName, totals] of Object.entries(botTotals)) {
+      if (totals.maxMp === 0) continue
+      const mpPct = +(totals.mp / totals.maxMp * 100).toFixed(1)
+      let prof = await DB.getProfile(botName) || makeProfile(botName)
+      prof.isBot = true
+      prof.sessions++
+      prof.totalMP += totals.mp
+      prof.totalMaxMP += totals.maxMp
+      const prev = calcWeightedRating(prof.history)
+      prof.history.push({ date: Date.now(), room: roomCode, orbits: totalOrbits, mpPct })
+      if (prof.history.length > 50) prof.history = prof.history.slice(-50)
+      if (mpPct > prof.bestPct) prof.bestPct = mpPct
+      await DB.saveProfile(botName, prof)
+    }
+  } catch (e) { console.error("Bot rating update error:", e) }
 }
 function ratingColor(r) { return tierInfo(r).color }
 function ratingTitle(r) { return tierInfo(r).name }
@@ -305,26 +360,34 @@ function Seat({player,isActive,position,showCards,dealerIndex}){
 
 function BetControls({phase,pot,betToCall,playerBet,playerChips,raises,onAction}){
   const[sv,setSv]=useState(0)
+  const[typedBet,setTypedBet]=useState("")
   const toCall=Math.max(betToCall-playerBet,0),canRaise=raises<MAX_RAISES&&playerChips>toCall
   const minR=betToCall+BB,maxR=playerChips+playerBet
-  useEffect(()=>{setSv(minR)},[minR,phase])
-  const btn=(l,a,am,bg,dis)=><button disabled={dis} onClick={()=>onAction(a,am)} style={{background:dis?"#333":bg,color:dis?"#666":"#fff",border:"none",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:600,cursor:dis?"default":"pointer",fontFamily:F,opacity:dis?0.5:1}}>{l}</button>
+  useEffect(()=>{setSv(minR);setTypedBet("")},[minR,phase])
+  const btn=(l,a,am,bg,dis)=><button disabled={dis} onClick={()=>onAction(a,am)} style={{background:dis?"#333":bg,color:dis?"#666":"#fff",border:"none",borderRadius:8,padding:"10px 16px",fontSize:13,fontWeight:700,cursor:dis?"default":"pointer",fontFamily:F,opacity:dis?0.5:1,minWidth:80}}>{l}</button>
   const presets=phase==="preflop"?[{l:"2x",v:BB*2},{l:"3x",v:BB*3},{l:"5x",v:BB*5},{l:"8x",v:BB*8}]:[{l:"33%",v:Math.floor(pot*0.33)},{l:"50%",v:Math.floor(pot*0.5)},{l:"75%",v:Math.floor(pot*0.75)},{l:"Pot",v:pot}]
-  return <div style={{width:"100%",maxWidth:660,padding:"8px",display:"flex",flexDirection:"column",gap:6,alignItems:"center"}}>
-    <div style={{display:"flex",gap:5,flexWrap:"wrap",justifyContent:"center"}}>
+  const submitTypedBet=()=>{const n=parseInt(typedBet);if(!isNaN(n)&&n>=minR&&n<=maxR){onAction("raise",n)}else if(!isNaN(n)&&n>maxR){onAction("raise",maxR)}else{setTypedBet("")}}
+  return <div style={{width:"100%",maxWidth:660,padding:"8px",display:"flex",flexDirection:"column",gap:10,alignItems:"center"}}>
+    <div style={{display:"flex",gap:8,flexWrap:"wrap",justifyContent:"center"}}>
       {toCall===0?btn("Check","check",0,"#2c3e50"):btn(`Call $${toCall}`,"call",0,"#27ae60")}
       {btn("Fold","fold",0,"#7f1d1d")}
       {canRaise&&btn(`All-In $${playerChips}`,"raise",maxR,"#8e44ad")}
     </div>
     {canRaise&&<>
-      <div style={{display:"flex",gap:3,flexWrap:"wrap",justifyContent:"center"}}>
-        {presets.map(({l,v})=>{const rAmt=Math.max(Math.min(v,maxR),minR);return <button key={l} onClick={()=>{setSv(rAmt);onAction("raise",rAmt)}} style={{background:"rgba(255,255,255,0.08)",color:"#ccc",border:"1px solid rgba(255,255,255,0.15)",borderRadius:5,padding:"4px 8px",fontSize:10,cursor:"pointer",fontFamily:F}}>{l} (${rAmt})</button>})}
+      <div style={{width:"100%",height:1,background:"rgba(255,255,255,0.06)",margin:"2px 0"}}/>
+      <div style={{display:"flex",gap:4,flexWrap:"wrap",justifyContent:"center"}}>
+        {presets.map(({l,v})=>{const rAmt=Math.max(Math.min(v,maxR),minR);return <button key={l} onClick={()=>{setSv(rAmt);onAction("raise",rAmt)}} style={{background:"rgba(255,255,255,0.08)",color:"#ccc",border:"1px solid rgba(255,255,255,0.15)",borderRadius:6,padding:"5px 10px",fontSize:11,cursor:"pointer",fontFamily:F}}>{l} (${rAmt})</button>})}
       </div>
-      <div style={{display:"flex",gap:6,alignItems:"center",width:"100%",maxWidth:380}}>
+      <div style={{display:"flex",gap:6,alignItems:"center",width:"100%",maxWidth:400}}>
         <span style={{fontSize:10,color:"#888"}}>${minR}</span>
         <input type="range" min={minR} max={maxR} step={BB} value={sv} onChange={e=>setSv(+e.target.value)} style={{flex:1,accentColor:"#f1c40f"}}/>
         <span style={{fontSize:10,color:"#888"}}>${maxR}</span>
-        <button onClick={()=>onAction("raise",sv)} style={{background:"linear-gradient(135deg,#e67e22,#d35400)",color:"white",border:"none",borderRadius:7,padding:"5px 12px",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:F}}>Raise ${sv}</button>
+        <button onClick={()=>onAction("raise",sv)} style={{background:"linear-gradient(135deg,#e67e22,#d35400)",color:"white",border:"none",borderRadius:7,padding:"6px 14px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:F}}>Raise ${sv}</button>
+      </div>
+      <div style={{display:"flex",gap:6,alignItems:"center",justifyContent:"center"}}>
+        <span style={{fontSize:10,color:"#888"}}>$</span>
+        <input type="number" placeholder={`${minR}-${maxR}`} value={typedBet} onChange={e=>setTypedBet(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submitTypedBet()} style={{width:90,background:"rgba(255,255,255,0.08)",border:"1px solid rgba(255,255,255,0.2)",borderRadius:6,padding:"5px 8px",fontSize:13,color:"#e0e0e0",fontFamily:F,textAlign:"center",outline:"none"}}/>
+        <button onClick={submitTypedBet} disabled={!typedBet} style={{background:typedBet?"linear-gradient(135deg,#e67e22,#d35400)":"#333",color:typedBet?"white":"#666",border:"none",borderRadius:7,padding:"5px 12px",fontSize:11,fontWeight:600,cursor:typedBet?"pointer":"default",fontFamily:F}}>Bet</button>
       </div>
     </>}
   </div>
@@ -341,6 +404,8 @@ function Lobby({onJoined,onViewResults}){
   const[status,setStatus]=useState("")
   const[loading,setLoading]=useState(false)
   const[profile,setProfile]=useState(null)
+  const[recentGames,setRecentGames]=useState([])
+  const[gamesLoading,setGamesLoading]=useState(true)
 
   // Look up player profile when name changes
   useEffect(()=>{
@@ -351,6 +416,35 @@ function Lobby({onJoined,onViewResults}){
     },400)
     return ()=>clearTimeout(t)
   },[name])
+
+  // Load recent games
+  useEffect(()=>{
+    async function loadGames(){
+      try{
+        const idx=await DB.getRoomIndex()
+        const enriched=[]
+        for(const g of idx.slice(0,12)){
+          const room=await DB.getRoom(g.code)
+          if(!room)continue
+          // Check completion status of each player
+          let allDone=true,anyStarted=false
+          const playerStatus=[]
+          for(const p of room.players){
+            const results=await DB.getAllResults(g.code,p.num,room.orbits)
+            const completed=results.filter(r=>r!==null).length
+            const done=completed>=room.orbits
+            if(!done)allDone=false
+            if(completed>0)anyStarted=true
+            playerStatus.push({...p,completed,done})
+          }
+          enriched.push({...g,players:room.players.map(p=>p.name),playerStatus,orbits:room.orbits,allDone,anyStarted,playerCount:room.players.length})
+        }
+        setRecentGames(enriched)
+      }catch(e){console.error(e)}
+      setGamesLoading(false)
+    }
+    loadGames()
+  },[])
 
   const createRoom=async()=>{
     if(!name.trim())return setStatus("Enter your name")
@@ -372,6 +466,9 @@ function Lobby({onJoined,onViewResults}){
       const rc=code.trim().toUpperCase()
       const room=await DB.getRoom(rc)
       if(!room){setLoading(false);return setStatus("Room not found")}
+      // Check if player has viewed results — block entry
+      const viewed=await DB.hasViewedResults(rc,name.trim())
+      if(viewed){setLoading(false);return setStatus("You've already viewed results for this room — can't join")}
       if(room.players.length>=10&&!room.players.some(p=>p.name===name.trim())){setLoading(false);return setStatus("Room is full (max 10)")}
       if(!room.players.some(p=>p.name===name.trim())){await DB.joinRoom(rc,name.trim())}
       const updatedRoom=await DB.getRoom(rc)
@@ -382,13 +479,32 @@ function Lobby({onJoined,onViewResults}){
     }catch(e){setLoading(false);setStatus("Error: "+e.message)}
   }
 
+  const joinGameFromList=async(g)=>{
+    if(!name.trim())return setStatus("Enter your name first")
+    const viewed=await DB.hasViewedResults(g.code,name.trim())
+    if(viewed)return setStatus("You've already viewed results for room "+g.code)
+    setCode(g.code);setMode("join");
+    // Auto-join if code is set
+    setTimeout(async()=>{
+      const rc=g.code
+      const room=await DB.getRoom(rc)
+      if(!room)return setStatus("Room not found")
+      if(room.players.length>=10&&!room.players.some(p=>p.name===name.trim()))return setStatus("Room full")
+      if(!room.players.some(p=>p.name===name.trim())){await DB.joinRoom(rc,name.trim())}
+      const updatedRoom=await DB.getRoom(rc)
+      const me=updatedRoom.players.find(p=>p.name===name.trim())
+      onJoined({code:rc,seeds:updatedRoom.seeds,orbits:updatedRoom.orbits,playerNum:me?me.num:updatedRoom.players.length,myName:name.trim(),totalPlayers:updatedRoom.players.length})
+    },50)
+  }
+
   const I={background:"rgba(255,255,255,0.08)",border:"1px solid rgba(255,255,255,0.15)",borderRadius:8,padding:"10px 14px",fontSize:15,color:"#e0e0e0",fontFamily:F,width:"100%",boxSizing:"border-box",outline:"none"}
   const B=(bg)=>({background:bg,color:"#fff",border:"none",borderRadius:10,padding:"12px 28px",fontSize:15,fontWeight:700,cursor:"pointer",fontFamily:F,width:"100%",opacity:loading?0.5:1})
 
   return <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"linear-gradient(135deg,#0a0a14,#0d1117,#0a0f0a)",padding:16,fontFamily:F,color:"#e0e0e0"}}>
     <div style={{maxWidth:420,width:"100%",background:"rgba(255,255,255,0.04)",borderRadius:16,padding:32,border:"1px solid rgba(255,255,255,0.08)"}}>
       <h1 style={{textAlign:"center",fontSize:28,color:"#f1c40f",marginBottom:4}}>Duplicate Poker</h1>
-      <div style={{textAlign:"center",color:"#888",fontSize:13,marginBottom:24}}>Same Cards · Different Decisions · Who Plays Better?</div>
+      <div style={{textAlign:"center",color:"#888",fontSize:13,marginBottom:4}}>Same Cards · Different Decisions · Who Plays Better?</div>
+      <div style={{textAlign:"center",marginBottom:20}}><button onClick={()=>setMode("rules")} style={{background:"none",border:"1px solid rgba(255,255,255,0.15)",borderRadius:20,padding:"4px 14px",fontSize:11,color:"#888",cursor:"pointer",fontFamily:F}}>📖 How It Works</button></div>
 
       {!mode&&<>
         <div style={{marginBottom:12}}><input placeholder="Your name" value={name} onChange={e=>setName(e.target.value)} style={I}/></div>
@@ -407,9 +523,43 @@ function Lobby({onJoined,onViewResults}){
         <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12}}>
           <button onClick={()=>{if(!name.trim())return setStatus("Enter your name");setMode("create")}} style={B("linear-gradient(135deg,#27ae60,#1e8449)")}>Create Room</button>
           <button onClick={()=>{if(!name.trim())return setStatus("Enter your name");setMode("join")}} style={B("linear-gradient(135deg,#2980b9,#1a5276)")}>Join Room</button>
-          <button onClick={()=>setMode("results")} style={B("linear-gradient(135deg,#8e44ad,#6c3483)")}>View Room Results</button>
           <button onClick={()=>onViewResults(null,null)} style={B("linear-gradient(135deg,#2c3e50,#1a252f)")}>Player Lookup</button>
+          <button onClick={()=>onViewResults("__rankings__",null)} style={B("linear-gradient(135deg,#8e44ad,#6c3483)")}>🏆 Rankings</button>
         </div>
+
+        {/* Recent & Ongoing Games */}
+        {recentGames.length>0&&<div style={{marginTop:8}}>
+          <div style={{color:"#888",fontSize:12,fontWeight:600,marginBottom:6}}>Recent Games</div>
+          {recentGames.map((g,i)=>{
+            const isIn=name.trim()&&g.players.includes(name.trim())
+            const statusLabel=g.allDone?"✓ Complete":g.anyStarted?"⏳ In Progress":"Waiting"
+            const statusColor=g.allDone?"#2ecc71":g.anyStarted?"#f1c40f":"#888"
+            const age=Date.now()-(g.created||0)
+            const ageStr=age<3600000?Math.floor(age/60000)+"m ago":age<86400000?Math.floor(age/3600000)+"h ago":Math.floor(age/86400000)+"d ago"
+            // Anyone can still play a room if they haven't already played it
+            const canPlay=name.trim()&&!isIn
+            const tapAction=canPlay?"tap to play →":isIn?"tap for results →":g.allDone?"tap for results →":"tap to join →"
+            return <div key={i} style={{padding:10,marginBottom:4,background:isIn?"rgba(46,204,113,0.05)":"rgba(255,255,255,0.02)",borderRadius:8,border:`1px solid ${isIn?"rgba(46,204,113,0.15)":"rgba(255,255,255,0.06)"}`,cursor:"pointer"}}
+              onClick={()=>{
+                if(!name.trim()){onViewResults(g.code,null);return}
+                if(isIn){onViewResults(g.code,null);return}
+                // Not in game yet — join it (even if "complete", others can still play)
+                joinGameFromList(g)
+              }}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div>
+                  <span style={{fontSize:14,fontWeight:700,color:"#f1c40f",marginRight:8}}>{g.code}</span>
+                  <span style={{fontSize:10,color:statusColor,fontWeight:600}}>{statusLabel}</span>
+                </div>
+                <div style={{fontSize:9,color:"#555"}}>{ageStr}</div>
+              </div>
+              <div style={{fontSize:11,color:"#aaa",marginTop:3}}>{g.players.join(", ")}</div>
+              <div style={{fontSize:9,color:"#555",marginTop:2}}>{g.orbits} orbits · {g.playerCount} player{g.playerCount!==1?"s":""}{isIn?" · 👤 You're in":""}</div>
+              <div style={{fontSize:9,color:canPlay?"#2ecc71":"#555",textAlign:"right"}}>{tapAction}</div>
+            </div>
+          })}
+        </div>}
+        {gamesLoading&&<div style={{textAlign:"center",color:"#555",fontSize:11,padding:8}}>Loading games...</div>}
       </>}
 
       {mode==="create"&&<>
@@ -428,19 +578,25 @@ function Lobby({onJoined,onViewResults}){
         <button onClick={joinRoom} disabled={loading} style={B("linear-gradient(135deg,#2980b9,#1a5276)")}>{loading?"Joining...":"Join Room"}</button>
       </>}
 
-      {mode==="results"&&<>
-        <div style={{marginBottom:12}}><input placeholder="Room code" value={code} onChange={e=>setCode(e.target.value.toUpperCase())} maxLength={4} style={{...I,textAlign:"center",fontSize:24,letterSpacing:8}}/></div>
-        <button onClick={()=>onViewResults(code.trim().toUpperCase(),null)} style={B("linear-gradient(135deg,#8e44ad,#6c3483)")}>View Results</button>
-      </>}
+      {mode==="rules"&&<div style={{lineHeight:1.7,fontSize:13,color:"#ccc"}}>
+        <h3 style={{color:"#f1c40f",fontSize:16,marginBottom:8,textAlign:"center"}}>How Duplicate Poker Works</h3>
+        <p style={{marginBottom:10}}>This is <strong style={{color:"#e0e0e0"}}>Texas Hold'em poker</strong>, with the luck of the cards removed — your success is only compared to other players who held the <strong style={{color:"#f1c40f"}}>exact same cards</strong>.</p>
+        <p style={{marginBottom:10,color:"#aaa",fontSize:12}}><strong style={{color:"#e0e0e0"}}>The Setup:</strong> Each table has 5 AI bots and one human. Every human in the room plays at their own table, but all tables are dealt the same cards from the same deck. At the start of each orbit, everyone begins with {STARTING} chips. Small blind is {SB}, big blind is {BB}, and there is a {ANTE} ante.</p>
+        <p style={{marginBottom:10,color:"#aaa",fontSize:12}}><strong style={{color:"#e0e0e0"}}>Scoring:</strong> After the orbit ({HANDS_PER_ORBIT} hands), compare the chip count of all players who sat in the same seat. The one with the fewest chips gets 0 matchpoints, 2nd fewest gets 1 matchpoint, all the way up to the person with the most chips getting N−1 matchpoints (where N is the number of tables in play). Additional tables of AI bots are used to fill in the field.</p>
+        <p style={{marginBottom:10,color:"#aaa",fontSize:12}}><strong style={{color:"#e0e0e0"}}>Orbits:</strong> When you move to the next orbit, everyone's chip stack resets to {STARTING}. A game lasts several orbits — you select the number when you create a room. The player with the most matchpoints wins.</p>
+        <p style={{marginBottom:10,color:"#aaa",fontSize:12}}><strong style={{color:"#e0e0e0"}}>Rating:</strong> Your career rating is your weighted matchpoint percentage across all sessions. Recent sessions count double. A rating of 57 means you outplay the field 57% of the time.</p>
+        <p style={{marginBottom:10,color:"#aaa",fontSize:12}}><strong style={{color:"#e0e0e0"}}>Async play:</strong> You don't need to be online at the same time. Create a room, share the code, and play on your own schedule. Players can still join completed games as long as they haven't already played that room.</p>
+        <p style={{color:"#888",fontSize:11,fontStyle:"italic"}}>No gambling — this is a pure skill competition. The cards are the same; only your decisions matter.</p>
+      </div>}
 
       {mode&&<button onClick={()=>setMode(null)} style={{background:"none",border:"none",color:"#666",fontSize:12,cursor:"pointer",fontFamily:F,marginTop:8,width:"100%",textAlign:"center"}}>← Back</button>}
-      {status&&<div style={{marginTop:10,textAlign:"center",fontSize:12,color:status.includes("rror")||status.includes("not")||status.includes("full")?"#e74c3c":"#888"}}>{status}</div>}
+      {status&&<div style={{marginTop:10,textAlign:"center",fontSize:12,color:status.includes("rror")||status.includes("not")||status.includes("full")||status.includes("already")?"#e74c3c":"#888"}}>{status}</div>}
 
       <div style={{marginTop:20,padding:12,background:"rgba(255,255,255,0.02)",borderRadius:8,border:"1px solid rgba(255,255,255,0.05)"}}>
         <div style={{fontSize:11,color:"#666",lineHeight:1.6}}>
           Play at your own pace — no need to be online at the same time.
-          Both players get the same cards in the same seat. Share the room code
-          and compare results whenever you're both done.
+          Everyone gets the same cards in the same seat. Share the room code
+          and compare results whenever you're done.
         </div>
       </div>
     </div>
@@ -570,7 +726,7 @@ function OrbitScore({orbit,sessionMP,sessionMaxMP,sessionIMPs,orbitNum,totalOrbi
 // ═══════════════════════════════════════════════
 // SESSION RESULTS (with optional opponent comparison)
 // ═══════════════════════════════════════════════
-function SessionResults({orbits,totalMP,maxMP,totalIMPs,myName,roomCode,playerNum,totalOrbits,onNew}){
+function SessionResults({orbits,totalMP,maxMP,totalIMPs,myName,roomCode,playerNum,totalOrbits,seeds,onNew}){
   const[others,setOthers]=useState([])
   const[checking,setChecking]=useState(false)
   const[checked,setChecked]=useState(false)
@@ -586,6 +742,8 @@ function SessionResults({orbits,totalMP,maxMP,totalIMPs,myName,roomCode,playerNu
     if(ratingDone.current)return
     ratingDone.current=true
     updateRating(myName,+pct,maxMP,totalMP,totalIMPs,roomCode,totalOrbits).then(r=>setRatingInfo(r)).catch(()=>{})
+    // Also update AI bot ratings for this room
+    if(typeof seeds!=="undefined"&&seeds){updateBotRatings(roomCode,totalOrbits,seeds).catch(()=>{})}
   },[])
 
   const checkPlayers=async()=>{
@@ -727,22 +885,40 @@ function RoomResults({roomInfo,onBack,onViewPlayer}){
     async function load(){
       const room=await DB.getRoom(roomInfo.code)
       if(!room){setLoading(false);return}
+      // Collect all orbit results for all players
       const pdata=[]
+      const orbitPnLs={} // orbitNum -> [{playerNum, pnl}]
       for(const p of room.players){
         const results=await DB.getAllResults(roomInfo.code,p.num,room.orbits)
         const completed=results.filter(r=>r!==null)
         const totalPnL=completed.reduce((s,r)=>s+(r.pnl||0),0)
-        // Aggregate stats across orbits
         const agg={hands:0,vpip:0,pfr:0,threeBet:0,betsRaises:0,calls:0,potsWon:0,threeBetOpp:0}
-        for(const r of completed){
-          if(r.stats){for(const k in agg)if(r.stats[k])agg[k]+=r.stats[k]}
+        for(const r of completed){if(r.stats){for(const k in agg)if(r.stats[k])agg[k]+=r.stats[k]}}
+        for(let o=1;o<=room.orbits;o++){
+          if(!orbitPnLs[o])orbitPnLs[o]=[]
+          if(results[o-1])orbitPnLs[o].push({num:p.num,pnl:results[o-1].pnl||0})
         }
         const profile=await DB.getProfile(p.name)
         const rating=profile&&profile.history.length>0?calcWeightedRating(profile.history):null
         pdata.push({...p,results,completed:completed.length,total:room.orbits,totalPnL,stats:agg,rating,profile})
       }
-      pdata.sort((a,b)=>b.totalPnL-a.totalPnL)
+      // Compute matchpoints for each player across shared orbits
+      for(const p of pdata){
+        let mp=0,maxMp=0
+        for(let o=1;o<=room.orbits;o++){
+          const myResult=p.results[o-1]
+          if(!myResult||!orbitPnLs[o])continue
+          const field=orbitPnLs[o].filter(x=>x.num!==p.num)
+          if(field.length===0)continue
+          const myPnl=myResult.pnl||0
+          for(const opp of field){if(myPnl>opp.pnl)mp+=2;else if(myPnl===opp.pnl)mp+=1;maxMp+=2}
+        }
+        p.mp=mp;p.maxMp=maxMp;p.mpPct=maxMp>0?(mp/maxMp*100):0
+      }
+      pdata.sort((a,b)=>b.mpPct-a.mpPct||b.totalPnL-a.totalPnL)
       setPlayers(pdata);setLoading(false)
+      // Mark results as viewed for all players in the room
+      if(roomInfo.myName){DB.markResultsViewed(roomInfo.code,roomInfo.myName).catch(()=>{})}
     }
     load()
   },[roomInfo.code])
@@ -752,7 +928,7 @@ function RoomResults({roomInfo,onBack,onViewPlayer}){
     <div style={{minHeight:"100vh",background:"linear-gradient(135deg,#0a0a14,#0d1117,#0a0f0a)",padding:16,display:"flex",flexDirection:"column",alignItems:"center",overflowY:"auto",fontFamily:S,color:"#e0e0e0"}}>
       <div style={{maxWidth:620,width:"100%",background:"rgba(255,255,255,0.04)",borderRadius:14,padding:24,border:"1px solid rgba(255,255,255,0.08)",margin:"20px 0"}}>
         <h2 style={{textAlign:"center",fontSize:20,color:"#f1c40f",marginBottom:2}}>Room {roomInfo.code} Results</h2>
-        <div style={{textAlign:"center",color:"#888",fontSize:12,marginBottom:16}}>{roomInfo.orbits} orbits · {players.length} player{players.length!==1?"s":""}</div>
+        <div style={{textAlign:"center",color:"#888",fontSize:12,marginBottom:16}}>{roomInfo.orbits} orbits · {players.length} player{players.length!==1?"s":""} · ranked by matchpoints</div>
 
         {loading?<div style={{textAlign:"center",color:"#888",padding:20}}>Loading...</div>:(
           <>
@@ -771,8 +947,8 @@ function RoomResults({roomInfo,onBack,onViewPlayer}){
                       {p.rating&&<span style={{fontSize:11,color:tierInfo(p.rating).color,fontWeight:600}}>{tierInfo(p.rating).icon}{p.rating}</span>}
                     </div>
                     <div style={{textAlign:"right"}}>
+                      <div style={{fontSize:14,fontWeight:700,color:p.mpPct>=55?"#2ecc71":p.mpPct>=45?"#f1c40f":"#e74c3c"}}>{p.mpPct.toFixed(1)}% MP</div>
                       <div style={{fontSize:18,fontWeight:800,color:p.totalPnL>=0?"#2ecc71":"#e74c3c"}}>{p.totalPnL>=0?"+":""}{p.totalPnL}</div>
-                      {!done&&<div style={{fontSize:9,color:"#f1c40f"}}>{p.completed}/{p.total} orbits</div>}
                     </div>
                   </div>
                   {done&&p.stats.hands>0&&<div style={{display:"flex",justifyContent:"space-around",textAlign:"center"}}>
@@ -949,6 +1125,71 @@ function PlayerLookup({onBack}){
 }
 
 // ═══════════════════════════════════════════════
+// RANKINGS / LEADERBOARD
+// ═══════════════════════════════════════════════
+function Rankings({onBack}){
+  const[entries,setEntries]=useState([])
+  const[loading,setLoading]=useState(true)
+  useEffect(()=>{
+    async function load(){
+      const names=new Set()
+      // Load known bot names
+      AI_PROFILES.forEach(p=>names.add(p.name))
+      // Load room index to discover human names
+      const idx=await DB.getRoomIndex()
+      for(const g of idx){if(g.players)g.players.forEach(n=>names.add(n))}
+      // Fetch profiles
+      const profiles=[]
+      for(const n of names){
+        const prof=await DB.getProfile(n)
+        if(prof&&prof.history&&prof.history.length>0){
+          const rating=calcWeightedRating(prof.history)
+          const tier=tierInfo(rating)
+          const careerPct=prof.totalMaxMP>0?(prof.totalMP/prof.totalMaxMP*100).toFixed(1):"—"
+          profiles.push({name:prof.name||n,rating,tier,sessions:prof.sessions,careerPct,bestPct:prof.bestPct,isBot:!!prof.isBot,totalIMPs:prof.totalIMPs||0})
+        }
+      }
+      profiles.sort((a,b)=>b.rating-a.rating)
+      setEntries(profiles);setLoading(false)
+    }
+    load()
+  },[])
+  return (
+    <div style={{minHeight:"100vh",background:"linear-gradient(135deg,#0a0a14,#0d1117,#0a0f0a)",padding:16,display:"flex",flexDirection:"column",alignItems:"center",overflowY:"auto",fontFamily:F,color:"#e0e0e0"}}>
+      <div style={{maxWidth:520,width:"100%",background:"rgba(255,255,255,0.04)",borderRadius:14,padding:24,border:"1px solid rgba(255,255,255,0.08)",margin:"20px 0"}}>
+        <h2 style={{textAlign:"center",fontSize:20,color:"#f1c40f",marginBottom:2}}>🏆 Rankings</h2>
+        <div style={{textAlign:"center",color:"#888",fontSize:11,marginBottom:16}}>All players & AI bots by weighted matchpoint %</div>
+        {loading?<div style={{textAlign:"center",color:"#888",padding:20}}>Loading...</div>:(
+          entries.length===0?<div style={{textAlign:"center",color:"#666",padding:20}}>No rated players yet. Play a session!</div>:
+          entries.map((e,i)=>(
+            <div key={i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 12px",marginBottom:4,background:i<3?"rgba(241,196,15,0.04)":"rgba(255,255,255,0.02)",borderRadius:8,border:`1px solid ${i===0?"rgba(241,196,15,0.2)":"rgba(255,255,255,0.06)"}`}}>
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                <span style={{fontSize:14,fontWeight:800,color:i===0?"#f1c40f":i===1?"#94a3b8":i===2?"#cd7f32":"#555",minWidth:24}}>#{i+1}</span>
+                <div>
+                  <div style={{display:"flex",alignItems:"center",gap:6}}>
+                    <span style={{fontSize:14,fontWeight:700,color:e.isBot?"#888":"#e0e0e0"}}>{e.name}</span>
+                    {e.isBot&&<span style={{fontSize:8,color:"#555",background:"rgba(255,255,255,0.06)",padding:"1px 5px",borderRadius:3}}>BOT</span>}
+                    <span style={{fontSize:10,color:e.tier.color}}>{e.tier.icon}</span>
+                  </div>
+                  <div style={{fontSize:9,color:"#555"}}>{e.sessions} session{e.sessions!==1?"s":""} · career {e.careerPct}% · best {e.bestPct.toFixed(0)}%</div>
+                </div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:22,fontWeight:800,color:e.tier.color}}>{e.rating}</div>
+                <div style={{fontSize:9,color:"#666"}}>{e.tier.name}</div>
+              </div>
+            </div>
+          ))
+        )}
+        <div style={{textAlign:"center",marginTop:16}}>
+          <button onClick={onBack} style={{background:"rgba(255,255,255,0.08)",color:"#e0e0e0",border:"1px solid rgba(255,255,255,0.15)",borderRadius:10,padding:"10px 24px",fontSize:14,cursor:"pointer",fontFamily:F}}>← Back</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ═══════════════════════════════════════════════
 // MAIN CONTROLLER
 // ═══════════════════════════════════════════════
 export default function App(){
@@ -1062,6 +1303,8 @@ export default function App(){
           if(g.handFlags.threeBet)g.stats.threeBet++
           if(handPnL>0||(winnerName.includes("You")))g.stats.potsWon++
         }
+        // Sound: chip rattle if human won
+        if(handPnL>0||winnerName.includes("You"))setTimeout(()=>playChipRattle(),100)
         g.handLog.push({handInOrbit:g.handInOrbit,humanCards:[...g.players[0].holeCards],community:[...g.community],humanResult:handPnL,winnerName,humanHandName:handName(humanR),humanFolded:g.players[0].folded,pot:g.pot})
         g.message=`${winnerName} wins $${g.pot}`;g.phase="handResult";return g
       })
@@ -1077,8 +1320,9 @@ export default function App(){
       const humanPnL=game.players[0].chips-STARTING
       const aiResults=[];for(let i=0;i<NUM_AI;i++){const pnl=simOrbit(game.seed,game.dealerIdx-HANDS_PER_ORBIT+1,i);aiResults.push({name:AI_PROFILES[i].name,pnl,isHuman:false})}
       const orbitResult={orbitNumber:game.orbitNumber,humanPnL,aiResults,handLog:game.handLog.slice(-HANDS_PER_ORBIT),roomCode:roomInfo.code,playerNum:roomInfo.playerNum}
-      // Store to Firebase (fire and forget)
-      DB.storeOrbitResult(roomInfo.code,roomInfo.playerNum,game.orbitNumber,{pnl:humanPnL,stats:game.stats||{}}).catch(e=>console.error("Store error:",e))
+      // Store to Firebase with AI pnls for bot rating computation
+      const aiPnls=aiResults.map(a=>({name:a.name,pnl:a.pnl}))
+      DB.storeOrbitResult(roomInfo.code,roomInfo.playerNum,game.orbitNumber,{pnl:humanPnL,stats:game.stats||{},aiPnls}).catch(e=>console.error("Store error:",e))
       setCurrentOrbit(orbitResult);setView("orbitScore")
     }else{
       setGame(prev=>({...prev,dealerIdx:(prev.dealerIdx+1)%6}));startHand()
@@ -1100,6 +1344,7 @@ export default function App(){
 
   const onViewResults=useCallback(async(code,name)=>{
     if(!code){setView("playerLookup");return}
+    if(code==="__rankings__"){setView("rankings");return}
     try{
       const room=await DB.getRoom(code)
       if(!room)return alert("Room not found")
@@ -1118,11 +1363,12 @@ export default function App(){
   if(view==="lobby")return <Lobby onJoined={onJoined} onViewResults={onViewResults}/>
   if(view==="shareCode"&&roomInfo)return <ShareCode code={roomInfo.code} orbits={roomInfo.orbits} onStart={startPlaying}/>
   if(view==="orbitScore"&&currentOrbit)return <OrbitScore orbit={currentOrbit} sessionMP={sessionMP} sessionMaxMP={sessionMaxMP} sessionIMPs={sessionIMPs} orbitNum={game.orbitNumber} totalOrbits={roomInfo.orbits} onNext={onOrbitNext}/>
-  if(view==="sessionEnd")return <SessionResults orbits={completedOrbits} totalMP={sessionMP+0} maxMP={sessionMaxMP+0} totalIMPs={sessionIMPs+0} myName={roomInfo.myName} roomCode={roomInfo.code} playerNum={roomInfo.playerNum} totalOrbits={roomInfo.orbits} onNew={reset}/>
+  if(view==="sessionEnd")return <SessionResults orbits={completedOrbits} totalMP={sessionMP+0} maxMP={sessionMaxMP+0} totalIMPs={sessionIMPs+0} myName={roomInfo.myName} roomCode={roomInfo.code} playerNum={roomInfo.playerNum} totalOrbits={roomInfo.orbits} seeds={roomInfo.seeds} onNew={reset}/>
   if(view==="viewResults"&&roomInfo)return selectedPlayer
     ? <PlayerDetail player={selectedPlayer} roomCode={roomInfo.code} totalOrbits={roomInfo.orbits} onBack={()=>setSelectedPlayer(null)}/>
     : <RoomResults roomInfo={roomInfo} onBack={reset} onViewPlayer={(p)=>setSelectedPlayer(p)}/>
   if(view==="playerLookup")return <PlayerLookup onBack={reset}/>
+  if(view==="rankings")return <Rankings onBack={reset}/>
 
   if(!game)return <Lobby onJoined={onJoined} onViewResults={onViewResults}/>
 
@@ -1159,10 +1405,20 @@ export default function App(){
   const isHumanTurn=cp.isHuman&&!cp.folded&&["preflop","flop","turn","river"].includes(game.phase)
   const humanPnL=game.players[0].chips-STARTING
 
-  return <div style={{minHeight:"100vh",background:"linear-gradient(135deg,#0a0a14,#0d1117,#0a0f0a)",display:"flex",flexDirection:"column",alignItems:"center",fontFamily:F,color:"#e0e0e0",padding:"8px 8px 0"}}>
+  // Sound: ding when it's your turn
+  const prevTurnRef=useRef(false)
+  useEffect(()=>{
+    if(isHumanTurn&&!prevTurnRef.current)playDing()
+    prevTurnRef.current=isHumanTurn
+  },[isHumanTurn])
+
+  const[showRules,setShowRules]=useState(false)
+
+  return <div style={{minHeight:"100vh",background:"linear-gradient(135deg,#0a0a14,#0d1117,#0a0f0a)",display:"flex",flexDirection:"column",alignItems:"center",fontFamily:F,color:"#e0e0e0",padding:"8px 8px 0",position:"relative"}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",width:"100%",maxWidth:660,marginBottom:4,padding:"0 4px"}}>
       <div style={{fontSize:11,color:"#888"}}>Hand {game.handInOrbit}/{HANDS_PER_ORBIT} · Orbit {game.orbitNumber}/{roomInfo.orbits} · {SB}/{BB}+{ANTE}</div>
       <div style={{display:"flex",gap:6,alignItems:"center"}}>
+        <button onClick={()=>setShowRules(!showRules)} style={{background:"none",border:"1px solid rgba(255,255,255,0.15)",borderRadius:12,width:20,height:20,fontSize:10,color:"#888",cursor:"pointer",padding:0,display:"flex",alignItems:"center",justifyContent:"center"}}>?</button>
         <span style={{fontSize:9,background:"rgba(241,196,15,0.15)",color:"#f1c40f",padding:"2px 6px",borderRadius:4}}>Room {roomInfo.code}</span>
         <div style={{background:"rgba(255,255,255,0.05)",borderRadius:5,padding:"1px 6px"}}>
           <span style={{fontSize:10,color:"#888"}}>P&L </span>
@@ -1170,6 +1426,12 @@ export default function App(){
         </div>
       </div>
     </div>
+    {showRules&&<div style={{position:"absolute",top:40,left:"50%",transform:"translateX(-50%)",zIndex:50,maxWidth:360,width:"90%",background:"rgba(10,10,20,0.96)",border:"1px solid rgba(241,196,15,0.3)",borderRadius:12,padding:16,fontSize:12,color:"#ccc",lineHeight:1.6,boxShadow:"0 8px 30px rgba(0,0,0,0.6)"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}><strong style={{color:"#f1c40f"}}>How It Works</strong><button onClick={()=>setShowRules(false)} style={{background:"none",border:"none",color:"#888",fontSize:16,cursor:"pointer"}}>✕</button></div>
+      <p style={{marginBottom:6}}>This is Texas Hold'em, but <strong style={{color:"#f1c40f"}}>every player gets the same cards</strong> in the same seat against the same AI bots. Each orbit starts with {STARTING} chips ({SB}/{BB} blinds, {ANTE} ante).</p>
+      <p style={{marginBottom:6}}>After each orbit, your chip count is compared to every other player who held the same cards. Fewest chips = 0 matchpoints, most chips = N−1 matchpoints. Most matchpoints wins.</p>
+      <p style={{color:"#888",fontSize:10,fontStyle:"italic"}}>No gambling — only decisions matter.</p>
+    </div>}
     <div style={{position:"relative",width:"100%",maxWidth:660,height:380}}>
       <div style={{position:"absolute",top:50,left:50,right:50,bottom:50,borderRadius:"50%",background:"radial-gradient(ellipse at center,#1a4a2e 0%,#0d3320 60%,#082218 100%)",border:"6px solid #2c1810",boxShadow:"inset 0 0 40px rgba(0,0,0,0.5), 0 4px 20px rgba(0,0,0,0.4)"}}/>
       <div style={{position:"absolute",top:"41%",left:"50%",transform:"translate(-50%,-50%)",textAlign:"center",zIndex:5}}>
