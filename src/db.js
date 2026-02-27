@@ -1,6 +1,6 @@
 // Firebase Firestore adapter for Duplicate Poker
 import { initializeApp } from 'firebase/app'
-import { getFirestore, doc, getDoc, setDoc } from 'firebase/firestore'
+import { getFirestore, doc, getDoc, setDoc, collection, query, orderBy, limit, getDocs } from 'firebase/firestore'
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "YOUR_API_KEY",
@@ -15,13 +15,12 @@ const app = initializeApp(firebaseConfig)
 const db = getFirestore(app)
 
 export async function createRoom(code, seed, orbits, seeds, playerName) {
-  const ref = doc(db, 'rooms', code)
-  await setDoc(ref, { code, seed, seeds, orbits, players: [{ name: playerName, num: 1 }], status: 'waiting', created: Date.now() })
+  await setDoc(doc(db, 'rooms', code), { code, seed, seeds, orbits, players: [{ name: playerName, num: 1 }], status: 'waiting', created: Date.now() })
+  await addToRoomIndex(code, playerName, orbits)
 }
 
 export async function getRoom(code) {
-  const ref = doc(db, 'rooms', code)
-  const snap = await getDoc(ref)
+  const snap = await getDoc(doc(db, 'rooms', code))
   return snap.exists() ? snap.data() : null
 }
 
@@ -33,6 +32,7 @@ export async function joinRoom(code, playerName) {
   }
   room.status = 'playing'
   await setDoc(doc(db, 'rooms', code), room)
+  await updateRoomIndex(code, room.players.map(p => p.name))
 }
 
 export async function storeOrbitResult(code, playerNum, orbitNum, result) {
@@ -57,4 +57,40 @@ export async function getProfile(name) {
 
 export async function saveProfile(name, profile) {
   await setDoc(doc(db, 'profiles', name.toLowerCase().trim()), profile)
+}
+
+// Room index for browsing
+export async function addToRoomIndex(code, creator, orbits) {
+  const ref = doc(db, 'meta', 'roomIndex')
+  const snap = await getDoc(ref)
+  const idx = snap.exists() ? snap.data().rooms || [] : []
+  idx.unshift({ code, creator, orbits, players: [creator], created: Date.now() })
+  if (idx.length > 50) idx.length = 50
+  await setDoc(ref, { rooms: idx })
+}
+
+export async function updateRoomIndex(code, playerNames) {
+  const ref = doc(db, 'meta', 'roomIndex')
+  const snap = await getDoc(ref)
+  if (!snap.exists()) return
+  const idx = snap.data().rooms || []
+  const r = idx.find(x => x.code === code)
+  if (r) r.players = playerNames
+  await setDoc(ref, { rooms: idx })
+}
+
+export async function getRoomIndex() {
+  const ref = doc(db, 'meta', 'roomIndex')
+  const snap = await getDoc(ref)
+  return snap.exists() ? snap.data().rooms || [] : []
+}
+
+// Track which results have been viewed
+export async function markResultsViewed(code, name) {
+  await setDoc(doc(db, 'viewed', `${code}-${name.toLowerCase().trim()}`), { viewed: true, timestamp: Date.now() })
+}
+
+export async function hasViewedResults(code, name) {
+  const snap = await getDoc(doc(db, 'viewed', `${code}-${name.toLowerCase().trim()}`))
+  return snap.exists()
 }
