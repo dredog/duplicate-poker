@@ -1,6 +1,6 @@
 // Firebase Firestore adapter for Duplicate Poker
 import { initializeApp } from 'firebase/app'
-import { getFirestore, doc, getDoc, setDoc, collection, query, orderBy, limit, getDocs } from 'firebase/firestore'
+import { getFirestore, doc, getDoc, setDoc } from 'firebase/firestore'
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "YOUR_API_KEY",
@@ -16,7 +16,7 @@ const db = getFirestore(app)
 
 export async function createRoom(code, seed, orbits, seeds, playerName) {
   await setDoc(doc(db, 'rooms', code), { code, seed, seeds, orbits, players: [{ name: playerName, num: 1 }], status: 'waiting', created: Date.now() })
-  await addToRoomIndex(code, playerName, orbits)
+  try { await addToRoomIndex(code, playerName, orbits) } catch(e) { console.warn("Room index update failed:", e) }
 }
 
 export async function getRoom(code) {
@@ -32,7 +32,7 @@ export async function joinRoom(code, playerName) {
   }
   room.status = 'playing'
   await setDoc(doc(db, 'rooms', code), room)
-  await updateRoomIndex(code, room.players.map(p => p.name))
+  try { await updateRoomIndex(code, room.players.map(p => p.name)) } catch(e) { console.warn("Room index update failed:", e) }
 }
 
 export async function storeOrbitResult(code, playerNum, orbitNum, result) {
@@ -87,10 +87,14 @@ export async function getRoomIndex() {
 
 // Track which results have been viewed
 export async function markResultsViewed(code, name) {
-  await setDoc(doc(db, 'viewed', `${code}-${name.toLowerCase().trim()}`), { viewed: true, timestamp: Date.now() })
+  try {
+    await setDoc(doc(db, 'viewed', `${code}-${name.toLowerCase().trim()}`), { viewed: true, timestamp: Date.now() })
+  } catch(e) { console.warn("Mark viewed failed:", e) }
 }
 
 export async function hasViewedResults(code, name) {
-  const snap = await getDoc(doc(db, 'viewed', `${code}-${name.toLowerCase().trim()}`))
-  return snap.exists()
+  try {
+    const snap = await getDoc(doc(db, 'viewed', `${code}-${name.toLowerCase().trim()}`))
+    return snap.exists()
+  } catch(e) { return false }
 }
